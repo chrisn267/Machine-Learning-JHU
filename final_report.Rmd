@@ -1,0 +1,1057 @@
+---
+title: "Practical Machine Learning"
+author: "Chris Nightingale"
+date: "09/05/2022"
+output: 
+    html_document:
+        theme: spacelab
+---
+
+```{css, echo=FALSE}
+.reduce {
+  font-size: 9pt;
+}
+```
+
+
+## Summary
+
+This paper is a write up of our initial exploration of machine learning algorithms applied to a classification task.  
+
+The task is to "use a dataset of wearable technology data for a group of people performing barbell lifts to predict how the barbells were being lifted" from a choice of five different techniques A-E called 'classe'.  A training dataset of 19,622 validations (with classe recorded) and a test set of 20 observations (without classe recorded) were provided.  The initial datasets have 160 variables of which 52 are suitable for model training. 
+
+We apply six different machine learning algorithms which literature sets out as being appropriate for classification problems, namely: logistic regression, naive bayes, random forest, k-nearest neighbour and support vector machines (with both linear kernel and radial kernel).  As this is our first time running these algorithms we also look at the effect of changing our pre-processing approach, our training percentage, and our random seed.
+
+We find that the best performing algorithms in terms of accuracy are random forest, k-nearest neighbours and support vector machines (radial kernel) all with accuracy >0.90, with random forest having the highest accuracy of >0.99.  The best performing algorithm accounting for accuracy and speed is k-nearest neighbours.
+
+When running the strongest algorithms on our test data we get a consensus for the classe of our 20 test observations.  This paper sets out our approach and results.  It is written in a reproducible way with longer code snippets provided as appendices.
+
+## Approach
+
+#### 1. Setup and Data Load
+
+First we set up our R environment and download the datasets specified from here: http://groupware.les.inf.puc-rio.br/har 
+
+```{r install, warning = FALSE, message = FALSE}
+library(caret)
+library(tidyverse)
+
+# download files from links provided
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "pml_training.csv")
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "pml_testing.csv")
+
+# read into R
+pml_train_full <- read.csv("pml_training.csv")
+pml_test_full <- read.csv("pml_testing.csv")
+```
+
+#### 2. Data Cleansing
+
+We first explore the data and see that some columns contain information which should not be included in machine learning algorithms, and other columns contain a lot of NA or blank values so will not be suitable for machine learning algorithms.  First we remove information columns:
+
+```{r data_cleanse1}
+# view first 10 columns
+head(pml_train_full[,1:10])
+
+# The first 7 columns are just information, keep column 1 as an index column and columns 6 & 7 in case we need information about windows later. 
+pml_train <- pml_train_full[,-c(2:5)]
+pml_test <- pml_test_full[,-c(2:5)]
+```
+
+Then we look at columns with NA or blank values and realise that some rows provide summary statistics for a each exercise 'window' and these have dedicated summary statistic variables which are sparsely populated.  We check the test dataset and realise that this data does not include the summary statistics and therefore these should not be included as variables in our model training (*see Appendix 1 for code*). So we remove variables which contain NA or blank values:
+
+```{r clease_data2}
+# We look at the data and notice a lot of columns are NA (in train and test data)
+train_na <- data.frame(col1 = names(pml_train), na_col = colSums(is.na(pml_train) | (pml_train == "")))
+test_na <- data.frame(col1 = names(pml_test), na_col = colSums(is.na(pml_test) | (pml_test == "")))
+
+# So we remove all data with summary statistics
+pml_train_slim <- pml_train[,(train_na$na_col == 0)]
+pml_test_slim <- pml_test[,(test_na$na_col == 0)]
+
+# We also ensure classe is a factor
+pml_train_slim$classe <- factor(pml_train_slim$classe) 
+pml_train_slim$classe <- relevel(pml_train_slim$classe, ref = 5)
+```
+
+We have now reduced our dataset from 160 variables to 56 variables, of these 56 variables 52 are explanatory variables, 3 are information and 1 is our output variable.  We can now  visualise the data to identify any outliers and to understand which classification methods are likely to be successful.
+
+```{r clease_data3, fig.align = 'center', fig.width = 10, fig.height = 7}
+# visualize all data as violin plot
+pml_train_slim_narrow <- pivot_longer(pml_train_slim, cols = 4:55, names_to = "var", values_to = "vals")
+
+g <- ggplot(data = pml_train_slim_narrow, aes(y = vals, x = classe, color = classe))
+g <- g + geom_violin()
+g <- g + facet_wrap(vars(var), scales = "free")
+g <- g + theme(axis.text.x = element_blank(),axis.text.y = element_blank(),
+               panel.background = element_blank())
+g
+```
+
+We see from these plots that some variables contain possible outlier points which we may want to remove to improve our learning algorithms.  Specifically we check the variables in the table below and choose to remove data corresponding to five of these variables.  We remove the data because it relates to small numbers of points or single points which appear to be the result of spurious movements or spurious data recording and as such will not help to train our algorithms (*see Appendix 2 for code*).  The other variables in the table appear to have some extreme results but they could be as the result of valid movements and may therefore help to train models.  
+
+| variable name | observation | action |
+|:----------|:----------|:----------|
+| gyros_dumbbell_z | one extreme data point    | remove X = 5373 |
+| gyros_belt_x | includes unusual range but could be valid    | none    |
+| gyros_belt_y | includes unusual range but could be valid    | none    |
+| gyros_belt_z | includes unusual range but could be valid    | none    |
+| gyros_forearm_z | 1 series of points with very unusual range    | remove num_window = 186 & 187 |
+| magnet_belt_x | 3 series of points with very unusul range (inc start and end)    | remove num_window = 1, 9, 10, 404, 863 |
+| magnet_belt_y | includes unusual range but could be valid    | none    |
+| magnet_belt_z | 1 series of points with very unusual range | remove num_window = 1 & 2 |
+| magnet_dumbbell_y |  one extreme data point |   remove X = 9274 |
+
+We remove these points shown and review plots of the variables and the points which have been removed (*see Appendix 2b for code*):
+
+```{r cleanse_data4}
+# save data as old for review
+pml_train_slim_old <- pml_train_slim
+pml_test_slim_old <- pml_test_slim
+pml_train_slim_narrow_old <- pml_train_slim_narrow
+
+# remove data points
+pml_train_slim <- pml_train_slim[(pml_train_slim$X != '5373'),]
+pml_train_slim <- pml_train_slim[(pml_train_slim$num_window != '186'),]
+pml_train_slim <- pml_train_slim[(pml_train_slim$num_window != '187'),]
+pml_train_slim <- pml_train_slim[!(pml_train_slim$num_window %in% c('1','9','10','404','863')),]
+pml_train_slim <- pml_train_slim[(pml_train_slim$num_window != '2'),]
+pml_train_slim <- pml_train_slim[(pml_train_slim$X != '9274'),]
+
+pml_train_slim_narrow <- pivot_longer(pml_train_slim, cols = 4:55, names_to = "var", values_to = "vals")
+```
+
+```{r cleanse_data5, echo = FALSE, fig.align = 'center', fig.width = 10, fig.height = 7}
+# plot data showing removed outliers
+subset_outlier <- c("gyros_dumbbell_z", "gyros_forearm_z",
+             "magnet_belt_x", "magnet_belt_z", "magnet_dumbbell_y")
+
+plot_data_outlier <- pml_train_slim_narrow_old %>% filter(var %in% subset_outlier)
+
+plot_data_gfz <- pml_train_slim_narrow_old %>% filter(var == "gyros_forearm_z")
+plot_data_gfz[,"var"] <- "gyros_forearm_z_(zoom)"
+plot_data_gfz <- plot_data_gfz[(plot_data_gfz$X != '5373'),]
+
+plot_data_use <- rbind(plot_data_outlier, plot_data_gfz)
+
+plot_data_use[,"outlier"] <- rep("keep", nrow(plot_data_use))
+plot_data_use[(plot_data_use$X == '5373'),"outlier"] <- "gyros_dumbbell_z"
+plot_data_use[(plot_data_use$num_window == '186'),"outlier"] <- "gyros_forearm_z"
+plot_data_use[(plot_data_use$num_window == '187'),"outlier"] <- "gyros_forearm_z"
+plot_data_use[(plot_data_use$num_window %in% c('1','9','10','404','863')),"outlier"] <- "magnet_belt_x"
+plot_data_use[(plot_data_use$num_window == '2'),"outlier"] <- "magnet_belt_z"
+plot_data_use[(plot_data_use$X == '9274'),"outlier"] <- "magnet_dumbbell_y"
+
+g <- ggplot(data = plot_data_use, aes(y = vals, x = num_window, color = outlier))
+g <- g + geom_point(size = 0.5)
+g <- g + scale_colour_manual(values = c("keep" = "grey",
+                                        "gyros_dumbbell_z" = "red",
+                                        "gyros_forearm_z" = "blue",
+                                        "magnet_belt_x" = "green",
+                                        "magnet_belt_z" = "purple",
+                                        "magnet_dumbbell_y" = "orange"))
+g <- g + facet_wrap(vars(var),nrow = 2, scales = "free")
+g <- g + theme_bw()
+g
+```
+
+We also review the violin plot again and see that the data appears more uniform:
+
+```{r cleanse_data6, fig.align = 'center', fig.width = 10, fig.height = 7}
+# visualize all data as violin plot
+pml_train_slim_narrow <- pivot_longer(pml_train_slim, cols = 4:55, names_to = "var", values_to = "vals")
+
+g <- ggplot(data = pml_train_slim_narrow, aes(y = vals, x = classe, color = classe))
+g <- g + geom_violin()
+g <- g + facet_wrap(vars(var), scales = "free")
+g <- g + theme(axis.text.x = element_blank(),axis.text.y = element_blank(),
+               panel.background = element_blank())
+g
+```
+
+
+#### 3. Model Training
+
+```{r ALL_FUNCTIONS, echo = FALSE}
+get_train_data <- function(seed = 1, split = 0.8) {
+    set.seed(seed)
+    trainIndex <<- createDataPartition(pml_train_slim$classe, p = split, list = F)
+    data_train <<- pml_train_slim[ trainIndex,-c(1:3)]
+    data_val  <<- pml_train_slim[-trainIndex,-c(1:3)]
+    data_all <<- pml_train_slim[,-c(1:3)]
+    data_test <<- pml_test_slim[,-c(1:3)]
+    data_test2 <<- pml_test_slim[,-c(1:3)]
+}
+
+set_preProcess <- function(preproc = "none") {
+    if (preproc != "none"){
+        model_pp <<- preProcess(data_train, method = preproc)
+        model_pp2 <<- preProcess(data_all, method = preproc)
+        data_train <<- predict(model_pp, data_train)
+        data_val <<- predict(model_pp, data_val)
+        data_all <<- predict(model_pp2, data_all)
+        data_test <<- predict(model_pp, data_test)
+        data_test2 <<- predict(model_pp2, data_test2)
+    }
+}
+
+set_trainControl <- function(rpt) {
+    trCont <<- trainControl(method = "repeatedcv", number = 10, repeats = rpt)
+}
+
+fit_model <- function(mthd) {
+    model_fit <<- train(classe ~ ., method = mthd, trControl = trCont, data = data_train)
+    pred_val <<- predict(model_fit, data_val)
+    pred_test <<- predict(model_fit, data_test)
+    conf_matrix <<- confusionMatrix(pred_val, data_val$classe)
+}
+
+fit_full_model <- function(mthd) {
+    model_fit2 <<- train(classe ~ ., method = mthd, trControl = trCont, data = data_all)
+    pred_test2 <<- predict(model_fit2, data_test2)
+}
+
+run_routine <- function(seed = 1, split = 0.8, preproc = "center,scale", rpt = 1, method = "knn") {
+    counter <- 1
+    output1 <<- list()
+    data_train <<- NULL
+    data_val <<- NULL
+    data_test <<- NULL
+    data_test2 <<- NULL
+    data_all <<- NULL
+    model_pp <<- NULL
+    model_pp2 <<- NULL
+    model_fit <<- NULL
+    model_fit2 <<- NULL
+    pred_val <<- NULL
+    pred_test <<- NULL
+    pred_test2 <<- NULL
+    conf_matrix <<- NULL
+    trCont <- NULL
+    
+    for (p in preproc){
+        for (s in seed){
+            for (r in rpt){
+                for (l in split){
+                    for (m in method){
+                        
+                        output1[[paste0("data",counter)]] <- list()
+                        output1[[paste0("run",counter)]] <- list()
+                        
+                        output1[[paste0("run",counter)]][["seed"]] <- s
+                        output1[[paste0("run",counter)]][["preproc"]] <- p
+                        output1[[paste0("run",counter)]][["rpt"]] <- r
+                        output1[[paste0("run",counter)]][["split"]] <- l
+                        output1[[paste0("run",counter)]][["method"]] <- m
+                        
+                        starttime <- Sys.time()                        
+                        get_train_data(s, l)
+                        set_preProcess(p)
+                        set_trainControl(r)
+                        fit_model(m)
+                        fit_full_model(m)
+                        endtime <- Sys.time()
+                        
+                        output1[[paste0("run",counter)]][["starttime"]] <- starttime
+                        output1[[paste0("run",counter)]][["endtime"]] <- endtime
+                        output1[[paste0("run",counter)]][["duration"]] <- as.numeric(endtime - starttime)
+                        
+                        output1[[paste0("data",counter)]][["data_train"]] <- data_train
+                        output1[[paste0("data",counter)]][["data_val"]] <- data_val
+                        output1[[paste0("data",counter)]][["data_test"]] <- data_test
+                        output1[[paste0("data",counter)]][["data_test2"]] <- data_test2
+                        output1[[paste0("data",counter)]][["data_all"]] <- data_all
+                        
+                        output1[[paste0("run",counter)]][["model_pp"]] <- model_pp
+                        output1[[paste0("run",counter)]][["model_fit"]] <- model_fit
+                        output1[[paste0("run",counter)]][["pred_val"]] <- pred_val
+                        output1[[paste0("run",counter)]][["pred_test"]] <- pred_test
+                        output1[[paste0("run",counter)]][["conf_matrix"]] <- conf_matrix
+                        output1[[paste0("run",counter)]][["model_pp2"]] <- model_pp2
+                        output1[[paste0("run",counter)]][["model_fit2"]] <- model_fit2
+                        output1[[paste0("run",counter)]][["pred_test2"]] <- pred_test2
+                        
+                        
+                        counter <- counter + 1
+                    }
+                }
+            }
+        }
+    }
+    return(output1)
+}
+
+reduce1 <- function(x){
+    
+    len <- length(x)/2
+    
+    outdf <- data.frame(id = rep("",len),
+                        seed = rep("",len),
+                        split = rep("",len),
+                        preproc = rep("",len),
+                        rpt = rep("",len),
+                        method = rep("",len),
+                        s_accuracy = rep("",len),
+                        v_accuracy = rep("",len),
+                        duration = rep("",len),
+                        m1 = rep("",len),
+                        m2 = rep("",len),
+                        m3 = rep("",len),
+                        m4 = rep("",len),
+                        m5 = rep("",len),
+                        m6 = rep("",len),
+                        m7 = rep("",len),
+                        m8 = rep("",len),
+                        m9 = rep("",len),
+                        m10 = rep("",len),
+                        m11 = rep("",len),
+                        m12 = rep("",len),
+                        m13 = rep("",len),
+                        m14 = rep("",len),
+                        m15 = rep("",len),
+                        m16 = rep("",len),
+                        m17 = rep("",len),
+                        m18 = rep("",len),
+                        m19 = rep("",len),
+                        m20 = rep("",len))
+    
+    for (ii in 1:len) {
+        
+        rlookup <- paste0("run",ii)
+        outdf[ii,"id"] <- as.character(ii)
+        outdf[ii,"seed"] <- x[[rlookup]][["seed"]]
+        outdf[ii,"split"] <- x[[rlookup]][["split"]]
+        outdf[ii,"preproc"] <- paste(x[[rlookup]][["preproc"]], collapse = ",")
+        outdf[ii,"rpt"] <- x[[rlookup]][["rpt"]]
+        outdf[ii,"method"] <- x[[rlookup]][["method"]]
+        outdf[ii,"duration"] <- x[[rlookup]][["duration"]]
+        outdf[ii,"s_accuracy"] <- as.numeric(mean(x[[rlookup]][["model_fit"]][["resample"]][["Accuracy"]]))
+        outdf[ii,"v_accuracy"] <- as.numeric(x[[rlookup]][["conf_matrix"]][["overall"]][1])
+        
+        for (jj in 1:20) {
+            
+            clookup <- paste0("m", jj)
+            outdf[ii,clookup] <- as.character(x[[rlookup]][["pred_test2"]][jj])
+            
+        }
+    }
+    return(outdf)
+}
+
+
+pplist = list("none", c("center","scale"), "pca")
+
+output_summary <- function(x = "sum", ml = method_list_all, pp = pplist) {
+    
+    m <- matrix(0, nrow = 5, ncol = 20)
+    output_slim1 <- output_slim %>% filter(method %in% ml) %>% filter(preproc %in% pp)
+
+    for (ii in 1:5) {
+        for (jj in 1:20) {
+            clookup <- paste0("m", jj)
+            if (x == "mean") {
+                os <- mean(output_slim1[(output_slim[,clookup] == LETTERS[ii]),"v_accuracy"])
+                round_ <- 2
+            } else {
+                os <- sum(output_slim1[(output_slim[,clookup] == LETTERS[ii]),"v_accuracy"])
+                round_ <- 0
+            }
+            if (is.nan(os)) {
+                m[ii,jj] <- 0
+            } else {
+                m[ii,jj] <- round(os,round_)
+            }
+        }
+    }
+    return(m)
+}
+
+output_summary_both <- function(ml = method_list_all) {
+    
+    m <- matrix("", nrow = 2, ncol = 20)
+    for (jj in 1:20) {
+        m[1,jj] <- LETTERS[1:5][(which.max(output_summary("mean", ml)[,jj]))]
+        m[2,jj] <- LETTERS[1:5][(which.max(output_summary("sum", ml)[,jj]))]
+    }
+    return(m)
+}
+```
+
+Now we have a clean dataset we are ready to start selecting and training our ML algorithms.  
+
+The first step is to split our training data into a training dataset and a validation dataset.  We do this even though we are going to use cross sampling within out training dataset, this allows us to see whether our cross sampling reports different accuracy figures to our validation dataset. We can do this comfortably as we have a large number of observations.  We initially split our training data as p = 70% giving 70:30 for training vs validation. (*see Appendix 3 for code*)
+
+We then run pre-processing routines on our data, we firstly run without any pre-processing but later use 'center and scale' and then PCA (principal component analysis).  For our cross validation we use 10-fold cross validation. (*see Appendix 4 and 5 for code*)
+
+For our model training we apply six different machine learning algorithms with their default hyperparameters: logistic regression, naive bayes, random forest, k-nearest neighbour, support vector machines (linear) and support vector machines (radial). (*see Appendix 6 for code*)
+
+Because we are new to this we write all the above as a series of function calls in order to be able to loop through some different workflow options for data splitting, pre-processing, cross-validation and model training.  (*see Appendix 7 for code*)
+
+We select the following different options for our workflow steps and apply all combinations for them (i.e. 2x2x3x1x6 = 72). 
+
+| workflow step | options | 
+|:----------|:----------|
+| datasplit | seed = 1 or 2 |
+| datasplit | train% = 70% or 85% |
+| pre-processing | none, center and scale or PCA | 
+| cross-validation | 10-fold (run once) | 
+| model training | multinom, naive_bayes, knn, rf, svmLinear or svmRadial |
+
+```{r model_training1, cache = TRUE, cache.lazy = FALSE, results = FALSE, message = FALSE, warning = FALSE} 
+output1<- run_routine(seed = c(1,2),
+                        split = c(0.70, 0.85), 
+                        preproc = list("none", c("center","scale"), "pca"),
+                        rpt = 1,
+                        method = c("multinom", "naive_bayes", "knn", "rf", "svmLinear", "svmRadial"))
+```
+
+A summary of our workflow for each combination of inputs is as follows
+
+1. Record workflow inputs for this run (selected from table above)
+2. Split the training dataset (pml_train_slim) into training_data and validation_data using RNG seed selected. 
+3. Run the selected pre-processing routine on training_data.
+4. Train the selected algorithm using training_data and the selected cross validation routine
+5. Record the best_model as returned by 'train' function
+6. Record the average accuracy for cross validation (sample_accuracy)
+7. Apply the best_model to validation_data
+8. Record the accuracy for validation dataset (validation_accuracy)
+9. Apply the best_model to test_data and record outputs.
+10. Repeat steps 2,3 & 8 using full_data instead of training_data
+11. Record time taken to run whole workflow
+12. Repeat steps 1 to 11 for every combination of workflow options in table above i.e. 72 times)
+
+The output from our function is a large list containing the following information for each run:
+
+- run info
+  + seed input (1 of 2)
+  + training data %split (1 of 2)
+  + preprocess input (1 of 3)
+  + cross validation input (1 of 1)
+  + training method input (1 of 6)
+  + time taken for whole run (minutes)
+- model training (training data)
+  + preprocess model (training data)
+  + best model (training data)
+  + validation predictions (training model)
+  + confusion matrix (training model vs validation actual)
+  + test predictions (training model)
+- model training (full data)
+  + preprocess model (full data)
+  + best model (full data)
+  + test predictions (full model)
+- data
+  + training data
+  + validation data
+  + test data
+  + full data = training + validation
+
+This is a lot of information so we write a short routine to process it (*see Appendix 9 for code*).  This returns the following:
+
+- summary info
+  + seed input (1 of 2)
+  + training data %split (1 of 2)
+  + preprocess input (1 of 3)
+  + cross validation input (1 of 1)
+  + training method input (1 of 6)
+  + run duration (minutes)
+  + sample accuracy (average cross validation accuracy from training model)
+  + validation accuracy (accuracy from confusion matrix of training model and validation actual
+  + test predictions (full model)
+
+This gives us an output dataframe which we can now use to analyse our results:
+
+```{r analyse_results1}
+output_slim <- reduce1(output1)
+output_slim[,c("s_accuracy")] <- as.numeric(output_slim[,c("s_accuracy")])
+output_slim[,c("v_accuracy")] <- as.numeric(output_slim[,c("v_accuracy")])
+output_slim[,c("duration")] <- as.numeric(output_slim[,c("duration")])
+
+head(output_slim,5)
+```
+
+#### 4. Analyse Results
+
+We start by looking at how model accuracy differs for the six different algorithms.  We see that the best performing algorithms are random forest, k-nearest neighbours and support vector machines (radial kernel) all with accuracy >0.90, with random forest having the highest accuracy of >0.99.  
+
+```{r analyse_results2}
+method_list_all = c("multinom", "naive_bayes", "knn", "rf", "svmLinear", "svmRadial")
+
+# This function summarises the accuracy of outputs grouped by a user defined variable
+# The user can specify a subset of methods to summarise over
+show_accuracy <- function (var, ml = method_list_all){
+    
+    output_slim1 <- output_slim %>% 
+                    filter(method %in% ml) %>%
+                    group_by_at(var) %>% 
+                    summarise(sample_accuracy = mean(s_accuracy), 
+                              valid_accuracy = mean(v_accuracy), 
+                              duration = mean(duration)) %>%
+                    arrange(desc(valid_accuracy)) %>% ungroup()
+    return(output_slim1)
+}
+
+show_accuracy(var = "method")
+```
+
+We note that 'knn' has both high accuracy but also low duration compared to other high performing algorithms.  We then look at how model accuracy differs for the other dimensions in our workflow, namely pre-processing routine, training split, and RNG seed.
+
+```{r analyse_results3}
+show_accuracy(var = "preproc")
+show_accuracy(var = "split")
+show_accuracy(var = "seed")
+```
+
+As expected accuracy does not change across the split or seed dimensions.  (noting that split may have an impact on accuracy for much smaller sample sizes).  The pre-processing does have some impact on accuracy when PCA is undertaken, this is to be expected as PCA will by its nature remove some detail from our underlying data, however it will be important to consider this in the trade off for performance (speed).
+
+We then look at how pre-processing affects the six different methods for both accuracy and speed.  In terms of accuracy we see that if we centre and scale the data it improves accuracy for the logistic regression and knn, whereas it does not impact the other methods.  We also see that PCA has a small impact on accuracy for knn, random forect and svmRadial, (these are our top performing models) but a larger impact on the worse performing models.
+
+```{r analyse_results5, message = FALSE, warning = FALSE}
+
+mp_accuracy <- output_slim %>% 
+    group_by(method,preproc) %>% 
+    summarise(valid_accuracy = mean(v_accuracy)) %>%
+    pivot_wider(names_from = "preproc", values_from = "valid_accuracy") %>%
+    relocate(none,.after = method) %>%
+    ungroup()
+
+mp_accuracy
+```
+
+
+We see that generally better performing algorithms have longer run-time.  We also see that PCA improves duration of model run, except for knn where using PCA drastically increases run-time.  
+
+```{r analyse_results5b, message = FALSE, warning = FALSE}
+
+mp_duration <- output_slim %>% 
+    group_by(method,preproc) %>% 
+    summarise(duration = mean(duration)) %>%
+    pivot_wider(names_from = "preproc", values_from = "duration") %>%
+    relocate(none,.after = method) %>%
+    ungroup()
+
+mp_duration
+```
+
+In order to try and find the most accurate forecast for each of the the 20 test observations we take the 'classe' selected for each of our 72 runs for that observation and weight it by the accuracy score for that run.  We then use two approaches for combining these weighted 'classes':  firstly taking the mean accuracy score for each classe, and secondly taking the total accuracy score for each classe.  We use two approaches since there are instances where a classe may score strongly for a few methods, but weakly for lots of methods (*see Appendix 9 for code*).
+
+```{r analyse_results6, echo = FALSE}
+pplist = list("none", c("center","scale"), "pca")
+
+output_summary <- function(x = "sum", ml = method_list_all, pp = pplist) {
+    
+    m <- matrix(0, nrow = 5, ncol = 20)
+    row.names(m) <- LETTERS[1:5]
+    output_slim1 <- output_slim %>% filter(method %in% ml) %>% filter(preproc %in% pp)
+    
+    for (ii in 1:5) {
+        for (jj in 1:20) {
+            clookup <- paste0("m", jj)
+            if (x == "mean") {
+                os <- mean(output_slim1[(output_slim1[,clookup] == LETTERS[ii]),"v_accuracy"])
+                round_ <- 2
+            } else {
+                os <- sum(output_slim1[(output_slim1[,clookup] == LETTERS[ii]),"v_accuracy"])
+                round_ <- 0
+            }
+            if (is.nan(os)) {
+                m[ii,jj] <- 0
+            } else {
+                m[ii,jj] <- round(os,round_)
+            }
+        }
+    }
+    return(m)
+}
+
+output_summary_both <- function(ml = method_list_all, pp = pplist){
+    
+    m <- matrix("", nrow = 2, ncol = 20)
+    row.names(m) <- c("mean", "sum")
+    for (jj in 1:20) {
+        m[1,jj] <- LETTERS[1:5][(which.max(output_summary("mean", ml, pp)[,jj]))]
+        m[2,jj] <- LETTERS[1:5][(which.max(output_summary("sum", ml, pp)[,jj]))]
+    }
+    return(m)
+}
+```
+
+```{r analyse_results7, class.output = "reduce", R.options = list(width = 160)}
+output_summary("mean")
+output_summary("sum")
+output_summary_both()
+```
+
+We see that averaging across all 6 methods (72 runs) we get broadly similar results for the 20 test observations, however there are  differences for observations 3, 6 and 11.  We would instinctively put more weight on the mean score rather than the total score however it is important to understand what the differences are.
+
+To try and improve this we restrict the methods we consider to the top 3 methods (36 runs) and re-run the analysis:
+
+```{r analyse_results8, class.output = "reduce", R.options = list(width = 160)}
+method_list_best = c("knn", "rf", "svmRadial")
+output_summary_both(method_list_best)
+```
+
+This gives us a consistent result for all 20 observations, 2 of our differences correct to the sum (3 & 6), and 1 corrects to the mean (11), so interesting that neither approach to averaging gave us a correct solution when using data from all six methods.  
+
+We then use the three best algorithms individually and find that random forest gives consistent results which are the same as our weighted average approach above. knn differs for one observation (11) when looking at the mean scores across runs.  swmRadial differs for two observations (6 & 11).  This level of variation away from the 'assumed correct' answer is consistent with the accuracy scores for each algorithm.
+
+```{r analyse_results9, class.output = "reduce", R.options = list(width = 160)}
+output_summary_both(c("rf", "centre,scale"))
+output_summary_both(c("knn", "centre,scale"))
+output_summary_both(c("svmRadial", "centre,scale"))
+```
+
+
+
+## Conclusion
+
+We conclude that the most accurate method in this case are random forest, knn, and svmRadial.  If we are looking for accuracy then we would run a weighted average of the three top algorithms (using their relative accuracy for weighting) and using repeated runs with different seeds, using only centre and scale pre-processing.  If we had to choose a single algorithm then we would use random forest for accuracy, but also consider knn if speed was an issue.  
+
+We note that the performance of our three most accurate algorithms is not materially impacted by using PCA pre-processing.  We also note that it took significant time for all six algorthms to run with the least accurate routines being the quickest appart from knn which was accurate and quick - hence knn is a clear best choice for accuracy vs. speed, especially when running without using PCA pre-processing.
+
+## Code Appendix
+
+```{r APPENDIX1, eval = FALSE}
+### APPENDIX1 - CHECKING ORIGINAL DATA FOR NA VALUES
+
+# We look at the data and notice a lot of columns are NA
+train_na <- data.frame(col1 = names(pml_train), na_col = colSums(is.na(pml_train) | (pml_train == "")))
+train_na <- train_na %>% mutate(perc_na = na_col / nrow(pml_train))
+head(train_na,10)
+
+# We realise this is because some rows give summary statistics for each window
+pml_train_nw <- pml_train[(pml_train$new_window == "yes"),]
+train_na2 <- data.frame(col1 = names(pml_train), na_col = colSums(is.na(pml_train_nw) | (pml_train_nw == "")))
+train_na2 <- train_na2 %>% mutate(perc_na = na_col / nrow(pml_train))
+head(train_na2,10)
+
+# We check the test data and realise this data does not include the summary statistics
+test_na <- data.frame(col1 = names(pml_test), na_col = colSums(is.na(pml_test) | (pml_test == "")))
+test_na <- test_na %>% mutate(perc_na = na_col / nrow(pml_test))
+head(test_na,10)
+```
+
+```{r APPENDIX2, eval = FALSE}
+### APPENDIX2 - CODE TO CHECK THROUGH VARABLES FOR OUTLIERS
+
+# set variable
+checkvar = 'gyros_dumbbell_z'   #remove X = 5373
+checkvar = 'gyros_belt_x'
+checkvar = 'gyros_belt_y'
+checkvar = 'gyros_belt_z'
+checkvar = 'gyros_forearm_z'    #remove num_window = 186 & 187
+checkvar = 'magnet_belt_x'      #remove num_window = 1,9,10, 404, 863
+checkvar = 'magnet_belt_y'
+checkvar = 'magnet_belt_z'      # remove 2 & (1)
+checkvar = 'magnet_dumbbell_y'  #remove X = 9274
+
+# view variable
+g <- ggplot(data = pml_train_slim_old, aes_string(y = checkvar, x = 'num_window', color = 'classe'))
+g <- g + geom_point()
+g
+
+# var gyros_dumbbell_z (max) remove X = 5373
+pml_train_slim_old$X[which.max(pml_train_slim$gyros_dumbbell_z)]
+
+# var gyros_forearm_z (max and min) remove num_window = 186 & 187
+pml_train_slim_old[order(pml_train_slim$gyros_forearm_z),][1:10,'num_window']
+pml_train_slim_old[order(-pml_train_slim$gyros_forearm_z),][1:10,'num_window']
+
+# var magnet_belt_x (max) remove num_window = 1,9,10,404,863
+# var magnet_belt_z (max) remove num_window = 2
+pml_train_slim_E_old <- pml_train_slim_old %>% filter(classe == 'E')
+pml_train_slim_E_old[order(-pml_train_slim_E$magnet_belt_x),][1:50,'num_window']
+pml_train_slim_E_old[order(-pml_train_slim_E$magnet_belt_z),][1:10,'num_window']
+
+# var magnet_dumbell_y (min) remove X = 9274
+pml_train_slim_old$X[which.min(pml_train_slim$magnet_dumbbell_y)]
+```
+
+```{r APPENDIX2b, eval = FALSE}
+### APPENDIX2B - CODE TO PLOT OUTLIER CHARTS
+
+# plot data showing removed outliers
+subset_outlier <- c("gyros_dumbbell_z", "gyros_forearm_z",
+             "magnet_belt_x", "magnet_belt_z", "magnet_dumbbell_y")
+
+plot_data_outlier <- pml_train_slim_narrow_old %>% filter(var %in% subset_outlier)
+
+plot_data_gfz <- pml_train_slim_narrow_old %>% filter(var == "gyros_forearm_z")
+plot_data_gfz[,"var"] <- "gyros_forearm_z_(zoom)"
+plot_data_gfz <- plot_data_gfz[(plot_data_gfz$X != '5373'),]
+
+plot_data_use <- rbind(plot_data_outlier, plot_data_gfz)
+
+plot_data_use[,"outlier"] <- rep("keep", nrow(plot_data_use))
+plot_data_use[(plot_data_use$X == '5373'),"outlier"] <- "gyros_dumbbell_z"
+plot_data_use[(plot_data_use$num_window == '186'),"outlier"] <- "gyros_forearm_z"
+plot_data_use[(plot_data_use$num_window == '187'),"outlier"] <- "gyros_forearm_z"
+plot_data_use[(plot_data_use$num_window %in% c('1','9','10','404','863')),"outlier"] <- "magnet_belt_x"
+plot_data_use[(plot_data_use$num_window == '2'),"outlier"] <- "magnet_belt_z"
+plot_data_use[(plot_data_use$X == '9274'),"outlier"] <- "magnet_dumbbell_y"
+
+g <- ggplot(data = plot_data_use, aes(y = vals, x = num_window, color = outlier))
+g <- g + geom_point(size = 0.5)
+g <- g + scale_colour_manual(values = c("keep" = "grey",
+                                        "gyros_dumbbell_z" = "red",
+                                        "gyros_forearm_z" = "blue",
+                                        "magnet_belt_x" = "green",
+                                        "magnet_belt_z" = "purple",
+                                        "magnet_dumbbell_y" = "orange"))
+g <- g + facet_wrap(vars(var),nrow = 2, scales = "free")
+g <- g + theme_bw()
+g
+
+```
+
+```{r APPENDIX3, eval = FALSE}
+### APPENDIX 3 - FUNCTION 
+### get_train_data
+
+# This function performs a datasplit on our dataset and produces training, validation and
+# test data sets.  Training and validation data is taken from the pml_train_slim dataset, 
+# testing is taken from pml_test_slim dataset.
+
+# inputs
+#   seed = a number for RNG seed
+#   split = a % to split training data into training and validation data
+# outputs
+#   none - performs the actions on pre-defined data structures
+
+get_train_data <- function(seed = 1, split = 0.8) {
+    set.seed(seed)
+    trainIndex <<- createDataPartition(pml_train_slim$classe, p = split, list = F)
+    data_train <<- pml_train_slim[ trainIndex,-c(1:3)]
+    data_val  <<- pml_train_slim[-trainIndex,-c(1:3)]
+    data_all <<- pml_train_slim[,-c(1:3)]
+    data_test <<- pml_test_slim[,-c(1:3)]
+    data_test2 <<- pml_test_slim[,-c(1:3)]
+}
+```
+
+```{r APPENDIX4, eval = FALSE}
+### APPENDIX 4 - FUNCTION 
+### set_preProcess
+
+# This function runs pre processing routines on our training, validation and test 
+# data sets.  Two pre-processing models are generated, one using training data and
+# a second using all data.  The pre-processing models are generated and then run on
+# the appropriate datasets to update them accordingly. 
+# (Note dataset is overwriten and not recorded)
+
+# inputs
+#   pp = a list of preprocess commands e.g. "pca", "center", "scale".  "none" = no preprocess
+# outputs
+#   none - performs the actions on pre-defined data structures
+
+set_preProcess <- function(preproc = "none") {
+    if (preproc != "none"){
+        model_pp <<- preProcess(data_train, method = preproc)
+        model_pp2 <<- preProcess(data_all, method = preproc)
+        data_train <<- predict(model_pp, data_train)
+        data_val <<- predict(model_pp, data_val)
+        data_all <<- predict(model_pp2, data_all)
+        data_test <<- predict(model_pp, data_test)
+        data_test2 <<- predict(model_pp2, data_test2)
+    }
+}
+```
+
+```{r APPENDIX5, eval = FALSE}
+### APPENDIX 5 - FUNCTION 
+### set_trCtrl
+
+# This function sets trainControl parameters for cross sampling/validation 
+
+# inputs
+#   method = a sampling method
+#   number = number of k-cross samples
+#   repeats = number of times to perfrom repeated cross validation
+# outputs
+#   none - performs the actions on pre-defined data structures
+
+
+set_trainControl <- function(rpt) {
+    trCont <<- trainControl(method = "repeatedcv", number = 10, repeats = rpt)
+}
+
+```
+
+```{r APPENDIX6, eval = FALSE}
+### APPENDIX 6 - FUNCTION 
+### fit_model
+
+# This function trains a model on the preprocessed TRAINING dataset using a predefined 
+# cross validation routine.  The routine then uses the model to predict the 'classe'
+# outcomes for both the validation and the test datasets.
+
+# inputs
+#   x = a ML clasification method
+# outputs
+#   none - performs the actions on pre-defined data structures
+
+fit_model <- function(mthd) {
+    model_fit <<- train(classe ~ ., method = mthd, trControl = trCont, data = data_train)
+    pred_val <<- predict(model_fit, data_val)
+    pred_test <<- predict(model_fit, data_test)
+    conf_matrix <<- confusionMatrix(pred_val, data_val$classe)
+}
+
+### fit_full_model
+
+# This function trains a model on the preprocessed FULL dataset using a predefined 
+# cross validation routine.  The routine then uses the model to predict the 'classe'
+# outcomes for the test dataset.
+
+# inputs
+#   x = a ML clasification method
+# outputs
+#   none - performs the actions on pre-defined data structures
+
+fit_full_model <- function(mthd) {
+    model_fit2 <<- train(classe ~ ., method = mthd, trControl = trCont, data = data_all)
+    pred_test2 <<- predict(model_fit2, data_test2)
+}
+```
+
+```{r APPENDIX7, eval = FALSE}
+### APPENDIX 7 - FUNCTION 
+### run_routine
+
+# This function wraps all of the sub-functions to run the ML workflow and stores the 
+# outputs into a predefined data structure for later analysis
+
+# inputs
+#   seeds = a number for RNG seed
+#   split =  a % to split training data into training and validation data
+#   preproc = a list of preprocess commands e.g. "pca", "center", "scale".  "none" = no preprocess
+#   trCtrl = number of times to perfrom repeated cross validation
+#   methods = a ML clasification method
+
+# outputs
+#   none - performs the actions on pre-defined data structures
+
+run_routine <- function(seed = 1, split = 0.8, preproc = "center,scale", rpt = 1, method = "knn") {
+    counter <- 1
+    output1 <<- list()
+    data_train <<- NULL
+    data_val <<- NULL
+    data_test <<- NULL
+    data_test2 <<- NULL
+    data_all <<- NULL
+    model_pp <<- NULL
+    model_pp2 <<- NULL
+    model_fit <<- NULL
+    model_fit2 <<- NULL
+    pred_val <<- NULL
+    pred_test <<- NULL
+    pred_test2 <<- NULL
+    conf_matrix <<- NULL
+    trCont <- NULL
+    
+    for (p in preproc){
+        for (s in seed){
+            for (r in rpt){
+                for (l in split){
+                    for (m in method){
+                        
+                        output1[[paste0("data",counter)]] <- list()
+                        output1[[paste0("run",counter)]] <- list()
+                        
+                        output1[[paste0("run",counter)]][["seed"]] <- s
+                        output1[[paste0("run",counter)]][["preproc"]] <- p
+                        output1[[paste0("run",counter)]][["rpt"]] <- r
+                        output1[[paste0("run",counter)]][["split"]] <- l
+                        output1[[paste0("run",counter)]][["method"]] <- m
+                        
+                        starttime <- Sys.time()                        
+                        get_train_data(s, l)
+                        set_preProcess(p)
+                        set_trainControl(r)
+                        fit_model(m)
+                        fit_full_model(m)
+                        endtime <- Sys.time()
+                                                
+                        output1[[paste0("run",counter)]][["starttime"]] <- starttime
+                        output1[[paste0("run",counter)]][["endtime"]] <- endtime
+                        output1[[paste0("run",counter)]][["duration"]] <- as.numeric(endtime - starttime)
+                        
+                        output1[[paste0("data",counter)]][["data_train"]] <- data_train
+                        output1[[paste0("data",counter)]][["data_val"]] <- data_val
+                        output1[[paste0("data",counter)]][["data_test"]] <- data_test
+                        output1[[paste0("data",counter)]][["data_test2"]] <- data_test2
+                        output1[[paste0("data",counter)]][["data_all"]] <- data_all
+                        
+                        output1[[paste0("run",counter)]][["model_pp"]] <- model_pp
+                        output1[[paste0("run",counter)]][["model_fit"]] <- model_fit
+                        output1[[paste0("run",counter)]][["pred_val"]] <- pred_val
+                        output1[[paste0("run",counter)]][["pred_test"]] <- pred_test
+                        output1[[paste0("run",counter)]][["conf_matrix"]] <- conf_matrix
+                        output1[[paste0("run",counter)]][["model_pp2"]] <- model_pp2
+                        output1[[paste0("run",counter)]][["model_fit2"]] <- model_fit2
+                        output1[[paste0("run",counter)]][["pred_test2"]] <- pred_test2
+                        
+                        
+                        counter <- counter + 1
+                    }
+                }
+            }
+        }
+    }
+    return(output1)
+}
+```
+
+```{r APPENDIX8, eval = FALSE}
+### APPENDIX 8 - CODE TO CALL MAIN RUN ROUTINE (ALSO INCLUDED IN MAIN DOC)
+
+# run routine
+run_routine(seeds = c(1,2),
+            split = c(0.7, 0.85),
+            preproc = list("none", c("center","scale"), "pca"),
+            trctrl = 1
+            methods = c("multinom", "naive_bayes", "knn", "rf", "svmLinear", "svmRadial"))
+```
+
+```{r APPENDIX9, eval = FALSE}
+### APPENDIX 9 - FUNCTION
+### reduce1
+
+# This function turns the output list from run_routine into a dataframe for analysis
+
+# inputs
+#   an output1 data structure from run_routine
+
+# outputs
+#   a dataframe with workflow options, accuracy outputs, and test predictions
+
+reduce1 <- function(x){
+    
+    len <- length(x)/2
+    
+    outdf <- data.frame(id = rep("",len),
+                        seed = rep("",len),
+                        split = rep("",len),
+                        preproc = rep("",len),
+                        rpt = rep("",len),
+                        method = rep("",len),
+                        s_accuracy = rep("",len),
+                        v_accuracy = rep("",len),
+                        duration = rep("",len),
+                        m1 = rep("",len),
+                        m2 = rep("",len),
+                        m3 = rep("",len),
+                        m4 = rep("",len),
+                        m5 = rep("",len),
+                        m6 = rep("",len),
+                        m7 = rep("",len),
+                        m8 = rep("",len),
+                        m9 = rep("",len),
+                        m10 = rep("",len),
+                        m11 = rep("",len),
+                        m12 = rep("",len),
+                        m13 = rep("",len),
+                        m14 = rep("",len),
+                        m15 = rep("",len),
+                        m16 = rep("",len),
+                        m17 = rep("",len),
+                        m18 = rep("",len),
+                        m19 = rep("",len),
+                        m20 = rep("",len))
+    
+    for (ii in 1:len) {
+        
+        rlookup <- paste0("run",ii)
+        outdf[ii,"id"] <- as.character(ii)
+        outdf[ii,"seed"] <- x[[rlookup]][["seed"]]
+        outdf[ii,"split"] <- x[[rlookup]][["split"]]
+        outdf[ii,"preproc"] <- paste(x[[rlookup]][["preproc"]], collapse = ",")
+        outdf[ii,"rpt"] <- x[[rlookup]][["rpt"]]
+        outdf[ii,"method"] <- x[[rlookup]][["method"]]
+        outdf[ii,"duration"] <- x[[rlookup]][["duration"]]
+        outdf[ii,"s_accuracy"] <- as.numeric(mean(x[[rlookup]][["model_fit"]][["resample"]][["Accuracy"]]))
+        outdf[ii,"v_accuracy"] <- as.numeric(x[[rlookup]][["conf_matrix"]][["overall"]][1])
+        
+        for (jj in 1:20) {
+            
+            clookup <- paste0("m", jj)
+            outdf[ii,clookup] <- as.character(x[[rlookup]][["pred_test2"]][jj])
+            
+        }
+    }
+    return(outdf)
+}
+```
+
+```{r APPENDIX10, eval = FALSE}
+### APPENDIX 10 - FUNCTION
+### output_summary
+
+# This function shows the accuracy score for the 5 classes across the 20 test observations
+# The user can specify whether to use the total score "sum" or the average score "mean".
+# The user can also specifcy a subset of methods to include in the scoring
+
+# inputs
+#   x = type of summary (sum or mean)
+#   ml = method list.  list of methods to include from:
+#           c("multinom", "naive_bayes", "knn", "rf", "svmLinear", "svmRadial")
+#   pp = preprocess list.  list of pp routines to include from:
+#           list("none", c("center","scale"), "pca")
+
+# outputs
+#   a summary matrix
+
+pplist = list("none", c("center","scale"), "pca")
+
+output_summary <- function(x = "sum", ml = method_list_all, pp = pplist) {
+    
+    m <- matrix(0, nrow = 5, ncol = 20)
+    row.names(m) <- LETTERS[1:5]
+    output_slim1 <- output_slim %>% filter(method %in% ml) %>% filter(preproc %in% pp)
+
+    for (ii in 1:5) {
+        for (jj in 1:20) {
+            clookup <- paste0("m", jj)
+            if (x == "mean") {
+                os <- mean(output_slim1[(output_slim[,clookup] == LETTERS[ii]),"v_accuracy"])
+                round_ <- 2
+            } else {
+                os <- sum(output_slim1[(output_slim[,clookup] == LETTERS[ii]),"v_accuracy"])
+                round_ <- 0
+            }
+            if (is.nan(os)) {
+                m[ii,jj] <- 0
+            } else {
+                m[ii,jj] <- round(os,round_)
+            }
+        }
+    }
+    return(m)
+}
+```
+
+```{r APPENDIX11, eval = FALSE}
+### APPENDIX 11 - FUNCTION
+### output_summary_both
+
+# This function summarises the accuracy score for the 2 types of summary across the 20 test observations
+# The user can also specifcy a subset of methods to include in the scoring
+
+# inputs
+#   ml = method list (list of methods to include from:
+#           c("multinom", "naive_bayes", "knn", "rf", "svmLinear", "svmRadial")
+
+# outputs
+#   a summary matrix
+
+output_summary_both <- function(ml = method_list_all) {
+    
+    m <- matrix("", nrow = 2, ncol = 20)
+    row.names(m) <- c("mean", "sum")
+    for (jj in 1:20) {
+        m[1,jj] <- LETTERS[1:5][(which.max(output_summary("mean", ml)[,jj]))]
+        m[2,jj] <- LETTERS[1:5][(which.max(output_summary("sum", ml)[,jj]))]
+    }
+    return(m)
+}
+```
+
